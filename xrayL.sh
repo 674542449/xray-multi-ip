@@ -4,11 +4,12 @@
 # Author: Improved based on bulianglin/demo
 # Features:
 #   1. Pure SOCKS5 & VMess+WS Support
-#   2. IPv4 + IPv6 Dual-Stack Global Ingress (双栈全网卡监听)
-#   3. Per-Port Dedicated Egress (sendThrough 端口分流独立落地)
-#   4. Automatic IPv6 Subnet (/64, /56, /48) Multi-IP Generation & Persistent Binding
-#   5. Multi-format batch proxy export (IP:Port:User:Pass)
-#   6. High concurrency tuning & Firewall auto-opening
+#   2. Automatic Google BBR & TCP High-Speed Optimization
+#   3. IPv4 + IPv6 Dual-Stack Global Ingress (双栈全网卡监听)
+#   4. Per-Port Dedicated Egress (sendThrough 端口分流独立落地)
+#   5. Automatic IPv6 Subnet (/64, /56, /48) Multi-IP Generation & Persistent Binding
+#   6. Multi-format batch proxy export (IP:Port:User:Pass)
+#   7. High concurrency tuning & Firewall auto-opening
 # Repository: https://github.com/674542449/xray-multi-ip
 # ==============================================================================
 
@@ -95,7 +96,48 @@ detect_arch() {
     esac
 }
 
-# 2. 完备的依赖检查与安装
+# 2. 自动检测并开启 Google BBR 与 TCP 拥塞调优
+enable_bbr() {
+    info "检测并优化 TCP 拥塞控制算法 (Google BBR)..."
+    local current_algo
+    current_algo=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
+    if [ "$current_algo" == "bbr" ]; then
+        info "Google BBR 拥塞控制算法已处于启用状态。"
+        return 0
+    fi
+
+    # 尝试加载内核模块
+    modprobe tcp_bbr 2>/dev/null || true
+
+    # 清理并写入 sysctl 优化配置
+    sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf 2>/dev/null || true
+    sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf 2>/dev/null || true
+    sed -i '/net.ipv4.tcp_fastopen/d' /etc/sysctl.conf 2>/dev/null || true
+    sed -i '/net.ipv4.tcp_slow_start_after_idle/d' /etc/sysctl.conf 2>/dev/null || true
+    sed -i '/net.ipv4.tcp_rmem/d' /etc/sysctl.conf 2>/dev/null || true
+    sed -i '/net.ipv4.tcp_wmem/d' /etc/sysctl.conf 2>/dev/null || true
+
+    cat << 'EOF' >> /etc/sysctl.conf
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_rmem = 4096 87380 67108864
+net.ipv4.tcp_wmem = 4096 65536 67108864
+EOF
+
+    sysctl -p >/dev/null 2>&1 || true
+
+    local new_algo
+    new_algo=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)
+    if [ "$new_algo" == "bbr" ]; then
+        info "Google BBR 拥塞控制加速已成功开启并生效！"
+    else
+        warn "当前系统内核可能缺少 BBR 模块，已保留默认网络配置。"
+    fi
+}
+
+# 3. 完备的依赖检查与安装
 install_dependencies() {
     info "检查并安装必要系统依赖..."
     local need_install=()
@@ -125,6 +167,9 @@ install_dependencies() {
     else
         info "所有基础依赖均已就绪。"
     fi
+
+    # 自动开启 BBR
+    enable_bbr
 }
 
 # 获取默认网络网卡接口名称
@@ -140,7 +185,7 @@ get_default_interface() {
     echo "${iface:-eth0}"
 }
 
-# 3. 自动放行防火墙端口 (IPv4 + IPv6 双栈)
+# 4. 自动放行防火墙端口 (IPv4 + IPv6 双栈)
 open_firewall() {
     local start_port=$1
     local end_port=$2
@@ -178,7 +223,7 @@ open_firewall() {
     fi
 }
 
-# 4. 获取服务器所有有效 IPv4
+# 5. 获取服务器所有有效 IPv4
 get_ipv4_addresses() {
     local ips=()
     if command -v ip &>/dev/null; then
@@ -260,7 +305,7 @@ format_ip_for_uri() {
     fi
 }
 
-# 5. IPv6 子网批量生成与绑定模块
+# 6. IPv6 子网批量生成与绑定模块
 batch_generate_and_bind_ipv6() {
     local default_iface
     default_iface=$(get_default_interface)
@@ -354,7 +399,7 @@ EOF
     info "已创建开机自启绑定脚本: ${IPV6_BIND_SCRIPT}"
 }
 
-# 6. 安装 Xray 内核与 Systemd 服务
+# 7. 安装 Xray 内核与 Systemd 服务
 install_xray() {
     install_dependencies
     detect_arch
@@ -430,11 +475,14 @@ EOF
     info "Xray 内核与服务安装完成！"
 }
 
-# 7. 配置生成与双栈/多落地路由 (标准原生 SOCKS5 与 VMess 模式)
+# 8. 配置生成与双栈/多落地路由 (标准原生 SOCKS5 与 VMess 模式)
 config_xray() {
     local config_type="$1" # socks, vmess
     local ip_mode="$2"     # 可选: v4, v6, dual
     mkdir -p "${CONFIG_DIR}"
+
+    # 自动激活 BBR
+    enable_bbr
 
     if [ "$config_type" != "socks" ] && [ "$config_type" != "vmess" ]; then
         err "类型错误！仅支持 socks 和 vmess。"
@@ -663,7 +711,7 @@ config_xray() {
     echo -e "${GREEN}==============================================================${PLAIN}\n"
 }
 
-# 8. 查看状态与控制
+# 9. 查看状态与控制
 service_status() {
     if systemctl is-active --quiet xrayL.service 2>/dev/null; then
         echo -e "XrayL 状态: ${GREEN}运行中 (Active)${PLAIN}"
@@ -708,14 +756,15 @@ show_menu() {
     echo -e "  ${GREEN}1.${PLAIN} 配置 SOCKS5 多 IP 代理 (IPv4+IPv6 双栈入口，端口分流落地)"
     echo -e "  ${GREEN}2.${PLAIN} 配置 VMess+WS 多 IP 代理 (双栈入口，批量生成 vmess:// 链接)"
     echo -e "  ${GREEN}3.${PLAIN} 批量生成并绑定 IPv6 子网地址 (如 /64 批量绑定 N 个 IP)"
-    echo -e "  ${GREEN}4.${PLAIN} 查看服务运行状态"
-    echo -e "  ${GREEN}5.${PLAIN} 重启代理服务"
-    echo -e "  ${GREEN}6.${PLAIN} 停止代理服务"
-    echo -e "  ${GREEN}7.${PLAIN} 查看导出文件列表 (Proxies / IP:Port:User:Pass)"
-    echo -e "  ${GREEN}8.${PLAIN} 彻底卸载 XrayL"
+    echo -e "  ${GREEN}4.${PLAIN} 启用/检测 Google BBR 网络加速"
+    echo -e "  ${GREEN}5.${PLAIN} 查看服务运行状态"
+    echo -e "  ${GREEN}6.${PLAIN} 重启代理服务"
+    echo -e "  ${GREEN}7.${PLAIN} 停止代理服务"
+    echo -e "  ${GREEN}8.${PLAIN} 查看导出文件列表 (Proxies / IP:Port:User:Pass)"
+    echo -e "  ${GREEN}9.${PLAIN} 彻底卸载 XrayL"
     echo -e "  ${GREEN}0.${PLAIN} 退出"
     echo -e "${CYAN}====================================================${PLAIN}"
-    read -r -p "请输入选项 [0-8]: " choice
+    read -r -p "请输入选项 [0-9]: " choice
     case "$choice" in
         1)
             [ -x "$BIN_PATH" ] || install_xray
@@ -729,15 +778,18 @@ show_menu() {
             batch_generate_and_bind_ipv6
             ;;
         4)
-            service_status
+            enable_bbr
             ;;
         5)
-            service_restart
+            service_status
             ;;
         6)
-            service_stop
+            service_restart
             ;;
         7)
+            service_stop
+            ;;
+        8)
             if [ -f "$EXPORT_SOCKS_FILE" ]; then
                 echo -e "\n${GREEN}默认导出列表 (${EXPORT_SOCKS_FILE}):${PLAIN}"
                 cat "$EXPORT_SOCKS_FILE"
@@ -755,7 +807,7 @@ show_menu() {
                 cat "$EXPORT_VMESS_FILE"
             fi
             ;;
-        8)
+        9)
             uninstall_xray
             ;;
         0)
@@ -786,6 +838,9 @@ main() {
                 [ -x "$BIN_PATH" ] || install_xray
                 config_xray "vmess" "$2"
                 ;;
+            bbr)
+                enable_bbr
+                ;;
             ipv6|bind-ipv6)
                 batch_generate_and_bind_ipv6
                 ;;
@@ -806,11 +861,11 @@ main() {
                 uninstall_xray
                 ;;
             help|-h|--help)
-                echo "用法: $0 [socks|vmess|ipv6|status|restart|stop|export|uninstall] [v4|v6|dual]"
+                echo "用法: $0 [socks|vmess|bbr|ipv6|status|restart|stop|export|uninstall] [v4|v6|dual]"
                 ;;
             *)
                 err "未知参数: $1"
-                echo "用法: $0 [socks|vmess|ipv6|status|restart|stop|export|uninstall] [v4|v6|dual]"
+                echo "用法: $0 [socks|vmess|bbr|ipv6|status|restart|stop|export|uninstall] [v4|v6|dual]"
                 exit 1
                 ;;
         esac
