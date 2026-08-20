@@ -3,11 +3,11 @@
 # Script Name: xrayL.sh (Multi-IP & Dual-Stack Xray Proxy Deployment Script)
 # Author: Improved based on bulianglin/demo
 # Features:
-#   1. Pure SOCKS5 & SOCKS5 over TLS (二选一，TLS 加密防 GFW 阻断，手机直连友好)
+#   1. Pure SOCKS5 & VMess+WS Support
 #   2. IPv4 + IPv6 Dual-Stack Global Ingress (双栈全网卡监听)
-#   3. Per-Port Dedicated Egress (sendThrough 端口分流落地)
+#   3. Per-Port Dedicated Egress (sendThrough 端口分流独立落地)
 #   4. Automatic IPv6 Subnet (/64, /56, /48) Multi-IP Generation & Persistent Binding
-#   5. Multi-format batch proxy export (IP:Port:User:Pass & SOCKS-TLS Links)
+#   5. Multi-format batch proxy export (IP:Port:User:Pass)
 #   6. High concurrency tuning & Firewall auto-opening
 # Repository: https://github.com/674542449/xray-multi-ip
 # ==============================================================================
@@ -30,9 +30,6 @@ BIN_PATH="/usr/local/bin/xrayL"
 IPV6_LIST_FILE="${CONFIG_DIR}/ipv6_custom.list"
 IPV6_BIND_SCRIPT="/usr/local/bin/xrayL-bind-ipv6"
 
-CERT_FILE="${CONFIG_DIR}/cert.crt"
-KEY_FILE="${CONFIG_DIR}/cert.key"
-
 # 导出基础目录
 if [ -w "/root" ]; then
     BASE_EXPORT_DIR="/root"
@@ -44,7 +41,6 @@ EXPORT_SOCKS_FILE="${BASE_EXPORT_DIR}/xray_proxies.txt"
 EXPORT_SOCKS_IPV4_FILE="${BASE_EXPORT_DIR}/xray_proxies_ipv4_entry.txt"
 EXPORT_SOCKS_IPV6_FILE="${BASE_EXPORT_DIR}/xray_proxies_ipv6_entry.txt"
 EXPORT_SOCKS_DIRECT_FILE="${BASE_EXPORT_DIR}/xray_proxies_direct.txt"
-EXPORT_SOCKS_TLS_LINKS="${BASE_EXPORT_DIR}/xray_socks_tls_links.txt"
 EXPORT_VMESS_FILE="${BASE_EXPORT_DIR}/xray_vmess.txt"
 
 DEFAULT_START_PORT=20000
@@ -103,7 +99,7 @@ detect_arch() {
 install_dependencies() {
     info "检查并安装必要系统依赖..."
     local need_install=()
-    local tools=("curl" "wget" "unzip" "ip" "openssl")
+    local tools=("curl" "wget" "unzip" "ip")
 
     for tool in "${tools[@]}"; do
         if ! command -v "$tool" &>/dev/null; then
@@ -114,15 +110,15 @@ install_dependencies() {
     if [ ${#need_install[@]} -gt 0 ]; then
         warn "缺少以下依赖: ${need_install[*]}，正在自动安装..."
         if command -v apt-get &>/dev/null; then
-            apt-get update -y && apt-get install -y wget curl unzip iproute2 iptables openssl
+            apt-get update -y && apt-get install -y wget curl unzip iproute2 iptables
         elif command -v yum &>/dev/null; then
-            yum install -y wget curl unzip iproute iptables openssl
+            yum install -y wget curl unzip iproute iptables
         elif command -v dnf &>/dev/null; then
-            dnf install -y wget curl unzip iproute iptables openssl
+            dnf install -y wget curl unzip iproute iptables
         elif command -v apk &>/dev/null; then
-            apk add --no-cache wget curl unzip iproute2 iptables ip6tables openssl
+            apk add --no-cache wget curl unzip iproute2 iptables ip6tables
         elif command -v pacman &>/dev/null; then
-            pacman -Sy --noconfirm wget curl unzip iproute2 iptables openssl
+            pacman -Sy --noconfirm wget curl unzip iproute2 iptables
         else
             warn "未能识别包管理器，请确保已手动安装: ${need_install[*]}"
         fi
@@ -144,21 +140,7 @@ get_default_interface() {
     echo "${iface:-eth0}"
 }
 
-# 3. 自动生成自签名 TLS 证书 (针对甲骨文云优化: CN=www.oracle.com)
-generate_self_signed_cert() {
-    mkdir -p "${CONFIG_DIR}"
-    info "正在生成 Oracle 甲骨文官方域名自签名 TLS 证书 (CN=www.oracle.com, 有效期 10 年)..."
-    openssl req -x509 -nodes -newkey rsa:2048 \
-        -keyout "${KEY_FILE}" \
-        -out "${CERT_FILE}" \
-        -days 3650 \
-        -subj "/C=US/ST=Texas/L=Austin/O=Oracle Corporation/CN=www.oracle.com" >/dev/null 2>&1
-    chmod 600 "${KEY_FILE}"
-    chmod 644 "${CERT_FILE}"
-    info "Oracle TLS 证书生成完毕。"
-}
-
-# 4. 自动放行防火墙端口 (IPv4 + IPv6 双栈)
+# 3. 自动放行防火墙端口 (IPv4 + IPv6 双栈)
 open_firewall() {
     local start_port=$1
     local end_port=$2
@@ -196,7 +178,7 @@ open_firewall() {
     fi
 }
 
-# 5. 获取服务器所有有效 IPv4
+# 4. 获取服务器所有有效 IPv4
 get_ipv4_addresses() {
     local ips=()
     if command -v ip &>/dev/null; then
@@ -278,7 +260,7 @@ format_ip_for_uri() {
     fi
 }
 
-# 6. IPv6 子网批量生成与绑定模块
+# 5. IPv6 子网批量生成与绑定模块
 batch_generate_and_bind_ipv6() {
     local default_iface
     default_iface=$(get_default_interface)
@@ -372,7 +354,7 @@ EOF
     info "已创建开机自启绑定脚本: ${IPV6_BIND_SCRIPT}"
 }
 
-# 7. 安装 Xray 内核与 Systemd 服务
+# 6. 安装 Xray 内核与 Systemd 服务
 install_xray() {
     install_dependencies
     detect_arch
@@ -448,42 +430,15 @@ EOF
     info "Xray 内核与服务安装完成！"
 }
 
-# 8. 配置生成与双栈/多落地路由 (支持 SOCKS 纯明文 vs SOCKS over TLS 二选一)
+# 7. 配置生成与双栈/多落地路由 (标准原生 SOCKS5 与 VMess 模式)
 config_xray() {
-    local config_type="$1" # socks, socks-tls, vmess
+    local config_type="$1" # socks, vmess
     local ip_mode="$2"     # 可选: v4, v6, dual
     mkdir -p "${CONFIG_DIR}"
 
-    local use_tls=0
-    if [ "$config_type" == "socks-tls" ]; then
-        use_tls=1
-        config_type="socks"
-    fi
-
     if [ "$config_type" != "socks" ] && [ "$config_type" != "vmess" ]; then
-        err "类型错误！仅支持 socks、socks-tls 和 vmess。"
+        err "类型错误！仅支持 socks 和 vmess。"
         exit 1
-    fi
-
-    # 如果是 SOCKS 模式且未指定 TLS 参数，提供二选一提示
-    if [ "$config_type" == "socks" ] && [ "$1" != "socks-tls" ] && [ "$1" != "socks-plain" ]; then
-        echo -e "\n${CYAN}======================== 选择 SOCKS5 加密模式 ========================${PLAIN}"
-        echo -e "  ${GREEN}1.${PLAIN} 纯明文 SOCKS5 (原生标准协议，适用于内网/专线/爬虫 IP 池)"
-        echo -e "  ${GREEN}2.${PLAIN} SOCKS5 over TLS (标准 TLS 加密，${GREEN}防 GFW 阻断，手机端直连推荐${PLAIN})"
-        echo -e "${CYAN}======================================================================${PLAIN}"
-        read -r -p "请输入选项 [1-2, 默认 2]: " socks_mode_choice
-        if [ "$socks_mode_choice" == "1" ]; then
-            use_tls=0
-            info "已选择: 纯明文 SOCKS5 模式。"
-        else
-            use_tls=1
-            info "已选择: SOCKS5 over TLS 加密模式。"
-        fi
-    fi
-
-    # 如果开启 TLS，准备证书
-    if [ $use_tls -eq 1 ]; then
-        generate_self_signed_cert
     fi
 
     local all_v4=($(get_ipv4_addresses))
@@ -577,7 +532,6 @@ config_xray() {
     > "${EXPORT_SOCKS_IPV4_FILE}"
     > "${EXPORT_SOCKS_IPV6_FILE}"
     > "${EXPORT_SOCKS_DIRECT_FILE}"
-    > "${EXPORT_SOCKS_TLS_LINKS}"
     > "${EXPORT_VMESS_FILE}"
 
     for ((i = 0; i < ${#target_ips[@]}; i++)); do
@@ -599,17 +553,6 @@ config_xray() {
             config_content+="user = \"${SOCKS_USERNAME}\"\n"
             config_content+="pass = \"${SOCKS_PASSWORD}\"\n"
 
-            # 如果启用 SOCKS5 over TLS，注入 streamSettings TLS 配置
-            if [ $use_tls -eq 1 ]; then
-                config_content+="[inbounds.streamSettings]\n"
-                config_content+="network = \"tcp\"\n"
-                config_content+="security = \"tls\"\n"
-                config_content+="[inbounds.streamSettings.tlsSettings]\n"
-                config_content+="certificates = [\n"
-                config_content+="  { certificateFile = \"${CERT_FILE}\", keyFile = \"${KEY_FILE}\" }\n"
-                config_content+="]\n"
-            fi
-
             # 1. 落地直连模式
             local formatted_egress
             formatted_egress=$(format_ip_for_uri "$egress_ip")
@@ -623,18 +566,6 @@ config_xray() {
             # 3. 主 IPv6 入口模式
             if [ -n "$primary_v6" ]; then
                 echo "[${primary_v6}]:${cur_port}:${SOCKS_USERNAME}:${SOCKS_PASSWORD}" >> "${EXPORT_SOCKS_IPV6_FILE}"
-            fi
-
-            # 4. 导出 SOCKS over TLS 客户端一键链接 (标准 Shadowrocket / Sing-box 格式)
-            if [ $use_tls -eq 1 ] && command -v base64 &>/dev/null; then
-                local entry_ip="${primary_v4:-$egress_ip}"
-                local formatted_entry
-                formatted_entry=$(format_ip_for_uri "$entry_ip")
-                # Shadowrocket 标准规范：对 "user:password@host:port" 整体进行 Base64 编码
-                local full_auth_host
-                full_auth_host=$(echo -n "${SOCKS_USERNAME}:${SOCKS_PASSWORD}@${entry_ip}:${cur_port}" | base64 | tr -d '\n')
-                local link="socks://${full_auth_host}?tls=1&allowInsecure=1&peer=www.oracle.com#MultiIP-Port${cur_port}-Out-${egress_ip}"
-                echo "$link" >> "${EXPORT_SOCKS_TLS_LINKS}"
             fi
 
         elif [ "$config_type" == "vmess" ]; then
@@ -653,7 +584,7 @@ config_xray() {
             fi
         fi
 
-        # 【出站】：指定 sendThrough 落地
+        # 【出站】：指定 sendThrough 独立落地
         config_content+="\n[[outbounds]]\n"
         config_content+="sendThrough = \"${egress_ip}\"\n"
         config_content+="protocol = \"freedom\"\n"
@@ -694,11 +625,7 @@ config_xray() {
     # 输出配置与导出信息
     echo -e "\n${GREEN}======================== 配置生成成功 ========================${PLAIN}"
     if [ "$config_type" == "socks" ]; then
-        if [ $use_tls -eq 1 ]; then
-            echo -e " 协议类型: ${CYAN}SOCKS5 over TLS (已启用标准 TLS 加密，防 GFW 探测)${PLAIN}"
-        else
-            echo -e " 协议类型: ${CYAN}纯明文 SOCKS5 (原生标准协议)${PLAIN}"
-        fi
+        echo -e " 协议类型: ${CYAN}原生标准 SOCKS5${PLAIN}"
     else
         echo -e " 协议类型: ${CYAN}VMess + WebSocket${PLAIN}"
     fi
@@ -716,10 +643,6 @@ config_xray() {
         [ -n "$primary_v4" ] && echo -e "  2. 主 IPv4 入口列表: ${YELLOW}${EXPORT_SOCKS_IPV4_FILE}${PLAIN}"
         [ -n "$primary_v6" ] && echo -e "  3. 主 IPv6 入口列表: ${YELLOW}${EXPORT_SOCKS_IPV6_FILE}${PLAIN}"
         echo -e "  4. 落地 IP 直连列表: ${YELLOW}${EXPORT_SOCKS_DIRECT_FILE}${PLAIN}"
-        if [ $use_tls -eq 1 ]; then
-            echo -e "  5. 手机/客户端直连链接: ${YELLOW}${EXPORT_SOCKS_TLS_LINKS}${PLAIN}"
-            echo -e "     ${CYAN}💡 手机 Shadowrocket 等客户端可直接导入 socks:// 链接使用（已配置 TLS + 跳过证书校验）${PLAIN}"
-        fi
         echo -e "--------------------------------------------------------------"
         echo -e " 节点预览 (前 5 个):"
         head -n 5 "${EXPORT_SOCKS_FILE}"
@@ -740,7 +663,7 @@ config_xray() {
     echo -e "${GREEN}==============================================================${PLAIN}\n"
 }
 
-# 9. 查看状态与控制
+# 8. 查看状态与控制
 service_status() {
     if systemctl is-active --quiet xrayL.service 2>/dev/null; then
         echo -e "XrayL 状态: ${GREEN}运行中 (Active)${PLAIN}"
@@ -782,51 +705,42 @@ show_menu() {
     echo -e "${CYAN}====================================================${PLAIN}"
     echo -e "${CYAN}   Xray 多 IP / 双栈入口与多出口代理一键部署管理    ${PLAIN}"
     echo -e "${CYAN}====================================================${PLAIN}"
-    echo -e "  ${GREEN}1.${PLAIN} 配置 SOCKS5 over TLS 代理 (${GREEN}TLS 加密防封，手机直连推荐${PLAIN})"
-    echo -e "  ${GREEN}2.${PLAIN} 配置 纯明文 SOCKS5 代理 (原生标准协议，内网/爬虫推荐)"
-    echo -e "  ${GREEN}3.${PLAIN} 配置 VMess+WS 多 IP 代理 (双栈入口，批量生成 vmess:// 链接)"
-    echo -e "  ${GREEN}4.${PLAIN} 批量生成并绑定 IPv6 子网地址 (如 /64 批量绑定 N 个 IP)"
-    echo -e "  ${GREEN}5.${PLAIN} 查看服务运行状态"
-    echo -e "  ${GREEN}6.${PLAIN} 重启代理服务"
-    echo -e "  ${GREEN}7.${PLAIN} 停止代理服务"
-    echo -e "  ${GREEN}8.${PLAIN} 查看导出文件列表 (Proxies / IP:Port:User:Pass / Links)"
-    echo -e "  ${GREEN}9.${PLAIN} 彻底卸载 XrayL"
+    echo -e "  ${GREEN}1.${PLAIN} 配置 SOCKS5 多 IP 代理 (IPv4+IPv6 双栈入口，端口分流落地)"
+    echo -e "  ${GREEN}2.${PLAIN} 配置 VMess+WS 多 IP 代理 (双栈入口，批量生成 vmess:// 链接)"
+    echo -e "  ${GREEN}3.${PLAIN} 批量生成并绑定 IPv6 子网地址 (如 /64 批量绑定 N 个 IP)"
+    echo -e "  ${GREEN}4.${PLAIN} 查看服务运行状态"
+    echo -e "  ${GREEN}5.${PLAIN} 重启代理服务"
+    echo -e "  ${GREEN}6.${PLAIN} 停止代理服务"
+    echo -e "  ${GREEN}7.${PLAIN} 查看导出文件列表 (Proxies / IP:Port:User:Pass)"
+    echo -e "  ${GREEN}8.${PLAIN} 彻底卸载 XrayL"
     echo -e "  ${GREEN}0.${PLAIN} 退出"
     echo -e "${CYAN}====================================================${PLAIN}"
-    read -r -p "请输入选项 [0-9]: " choice
+    read -r -p "请输入选项 [0-8]: " choice
     case "$choice" in
         1)
             [ -x "$BIN_PATH" ] || install_xray
-            config_xray "socks-tls"
+            config_xray "socks"
             ;;
         2)
             [ -x "$BIN_PATH" ] || install_xray
-            config_xray "socks-plain"
-            ;;
-        3)
-            [ -x "$BIN_PATH" ] || install_xray
             config_xray "vmess"
             ;;
-        4)
+        3)
             batch_generate_and_bind_ipv6
             ;;
-        5)
+        4)
             service_status
             ;;
-        6)
+        5)
             service_restart
             ;;
-        7)
+        6)
             service_stop
             ;;
-        8)
+        7)
             if [ -f "$EXPORT_SOCKS_FILE" ]; then
                 echo -e "\n${GREEN}默认导出列表 (${EXPORT_SOCKS_FILE}):${PLAIN}"
                 cat "$EXPORT_SOCKS_FILE"
-            fi
-            if [ -f "$EXPORT_SOCKS_TLS_LINKS" ] && [ -s "$EXPORT_SOCKS_TLS_LINKS" ]; then
-                echo -e "\n${GREEN}SOCKS5 over TLS 客户端直连链接 (${EXPORT_SOCKS_TLS_LINKS}):${PLAIN}"
-                cat "$EXPORT_SOCKS_TLS_LINKS"
             fi
             if [ -f "$EXPORT_SOCKS_IPV4_FILE" ] && [ -s "$EXPORT_SOCKS_IPV4_FILE" ]; then
                 echo -e "\n${GREEN}IPv4 入口列表 (${EXPORT_SOCKS_IPV4_FILE}):${PLAIN}"
@@ -841,7 +755,7 @@ show_menu() {
                 cat "$EXPORT_VMESS_FILE"
             fi
             ;;
-        9)
+        8)
             uninstall_xray
             ;;
         0)
@@ -868,14 +782,6 @@ main() {
                 [ -x "$BIN_PATH" ] || install_xray
                 config_xray "socks" "$2"
                 ;;
-            socks-tls|tls)
-                [ -x "$BIN_PATH" ] || install_xray
-                config_xray "socks-tls" "$2"
-                ;;
-            socks-plain|plain)
-                [ -x "$BIN_PATH" ] || install_xray
-                config_xray "socks-plain" "$2"
-                ;;
             vmess)
                 [ -x "$BIN_PATH" ] || install_xray
                 config_xray "vmess" "$2"
@@ -894,18 +800,17 @@ main() {
                 ;;
             export)
                 [ -f "$EXPORT_SOCKS_FILE" ] && cat "$EXPORT_SOCKS_FILE"
-                [ -f "$EXPORT_SOCKS_TLS_LINKS" ] && cat "$EXPORT_SOCKS_TLS_LINKS"
                 [ -f "$EXPORT_VMESS_FILE" ] && cat "$EXPORT_VMESS_FILE"
                 ;;
             uninstall)
                 uninstall_xray
                 ;;
             help|-h|--help)
-                echo "用法: $0 [socks|socks-tls|socks-plain|vmess|ipv6|status|restart|stop|export|uninstall] [v4|v6|dual]"
+                echo "用法: $0 [socks|vmess|ipv6|status|restart|stop|export|uninstall] [v4|v6|dual]"
                 ;;
             *)
                 err "未知参数: $1"
-                echo "用法: $0 [socks|socks-tls|socks-plain|vmess|ipv6|status|restart|stop|export|uninstall] [v4|v6|dual]"
+                echo "用法: $0 [socks|vmess|ipv6|status|restart|stop|export|uninstall] [v4|v6|dual]"
                 exit 1
                 ;;
         esac
