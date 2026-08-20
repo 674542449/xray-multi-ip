@@ -144,22 +144,18 @@ get_default_interface() {
     echo "${iface:-eth0}"
 }
 
-# 3. 自动生成自签名 TLS 证书 (用于 SOCKS5 over TLS)
+# 3. 自动生成自签名 TLS 证书 (针对甲骨文云优化: CN=www.oracle.com)
 generate_self_signed_cert() {
     mkdir -p "${CONFIG_DIR}"
-    if [ ! -f "${CERT_FILE}" ] || [ ! -f "${KEY_FILE}" ]; then
-        info "正在生成高强度自签名 TLS 证书 (有效期 10 年)..."
-        openssl req -x509 -nodes -newkey rsa:2048 \
-            -keyout "${KEY_FILE}" \
-            -out "${CERT_FILE}" \
-            -days 3650 \
-            -subj "/C=US/ST=California/L=Los Angeles/O=Cloudflare Inc/CN=www.cloudflare.com" >/dev/null 2>&1
-        chmod 600 "${KEY_FILE}"
-        chmod 644 "${CERT_FILE}"
-        info "TLS 证书生成完毕。"
-    else
-        info "已检测到现有 TLS 证书，复用证书配置。"
-    fi
+    info "正在生成 Oracle 甲骨文官方域名自签名 TLS 证书 (CN=www.oracle.com, 有效期 10 年)..."
+    openssl req -x509 -nodes -newkey rsa:2048 \
+        -keyout "${KEY_FILE}" \
+        -out "${CERT_FILE}" \
+        -days 3650 \
+        -subj "/C=US/ST=Texas/L=Austin/O=Oracle Corporation/CN=www.oracle.com" >/dev/null 2>&1
+    chmod 600 "${KEY_FILE}"
+    chmod 644 "${CERT_FILE}"
+    info "Oracle TLS 证书生成完毕。"
 }
 
 # 4. 自动放行防火墙端口 (IPv4 + IPv6 双栈)
@@ -637,7 +633,7 @@ config_xray() {
                 # Shadowrocket 标准规范：对 "user:password@host:port" 整体进行 Base64 编码
                 local full_auth_host
                 full_auth_host=$(echo -n "${SOCKS_USERNAME}:${SOCKS_PASSWORD}@${entry_ip}:${cur_port}" | base64 | tr -d '\n')
-                local link="socks://${full_auth_host}?tls=1&allowInsecure=1&peer=www.cloudflare.com#MultiIP-Port${cur_port}-Out-${egress_ip}"
+                local link="socks://${full_auth_host}?tls=1&allowInsecure=1&peer=www.oracle.com#MultiIP-Port${cur_port}-Out-${egress_ip}"
                 echo "$link" >> "${EXPORT_SOCKS_TLS_LINKS}"
             fi
 
