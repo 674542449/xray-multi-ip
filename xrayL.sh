@@ -629,12 +629,15 @@ config_xray() {
                 echo "[${primary_v6}]:${cur_port}:${SOCKS_USERNAME}:${SOCKS_PASSWORD}" >> "${EXPORT_SOCKS_IPV6_FILE}"
             fi
 
-            # 4. 导出 SOCKS over TLS 客户端一键链接 (支持 Shadowrocket / Sing-box / Clash)
+            # 4. 导出 SOCKS over TLS 客户端一键链接 (标准 Shadowrocket / Sing-box 格式)
             if [ $use_tls -eq 1 ] && command -v base64 &>/dev/null; then
                 local entry_ip="${primary_v4:-$egress_ip}"
-                local auth_b64
-                auth_b64=$(echo -n "${SOCKS_USERNAME}:${SOCKS_PASSWORD}" | base64 | tr -d '\n')
-                local link="socks://${auth_b64}@${entry_ip}:${cur_port}?tls=1&allowInsecure=1&peer=www.cloudflare.com#MultiIP-Port${cur_port}-Out-${egress_ip}"
+                local formatted_entry
+                formatted_entry=$(format_ip_for_uri "$entry_ip")
+                # Shadowrocket 标准规范：对 "user:password@host:port" 整体进行 Base64 编码
+                local full_auth_host
+                full_auth_host=$(echo -n "${SOCKS_USERNAME}:${SOCKS_PASSWORD}@${entry_ip}:${cur_port}" | base64 | tr -d '\n')
+                local link="socks://${full_auth_host}?tls=1&allowInsecure=1&peer=www.cloudflare.com#MultiIP-Port${cur_port}-Out-${egress_ip}"
                 echo "$link" >> "${EXPORT_SOCKS_TLS_LINKS}"
             fi
 
