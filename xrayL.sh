@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Script Name: xrayL.sh (Multi-IP Xray Proxy Deployment Script)
-# Author: Improved based on bulianglin/demo
-# Description: Automatically deploy multi-IP multi-inbound/outbound Xray proxies
+# Script Name: xrayL.sh (Multi-IP & Dual-Stack Xray Proxy Deployment Script)
+# Author: Improved based on bulianglin/demo (with Dual-Stack Ingress & Multi-Egress)
+# Description: Automatically deploy multi-IP dual-stack inbounds & per-port egress Xray proxies
 # Repository: https://github.com/674542449/xray-multi-ip
 # ==============================================================================
 
@@ -13,6 +13,7 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
+BOLD='\033[1m'
 PLAIN='\033[0m'
 
 # 核心路径与默认变量
@@ -21,14 +22,18 @@ CONFIG_FILE="${CONFIG_DIR}/config.toml"
 SERVICE_FILE="/etc/systemd/system/xrayL.service"
 BIN_PATH="/usr/local/bin/xrayL"
 
-# 导出文件路径
+# 导出基础目录
 if [ -w "/root" ]; then
-    EXPORT_SOCKS_FILE="/root/xray_proxies.txt"
-    EXPORT_VMESS_FILE="/root/xray_vmess.txt"
+    BASE_EXPORT_DIR="/root"
 else
-    EXPORT_SOCKS_FILE="${HOME}/xray_proxies.txt"
-    EXPORT_VMESS_FILE="${HOME}/xray_vmess.txt"
+    BASE_EXPORT_DIR="${HOME}"
 fi
+
+EXPORT_SOCKS_FILE="${BASE_EXPORT_DIR}/xray_proxies.txt"
+EXPORT_SOCKS_IPV4_FILE="${BASE_EXPORT_DIR}/xray_proxies_ipv4_entry.txt"
+EXPORT_SOCKS_IPV6_FILE="${BASE_EXPORT_DIR}/xray_proxies_ipv6_entry.txt"
+EXPORT_SOCKS_DIRECT_FILE="${BASE_EXPORT_DIR}/xray_proxies_direct.txt"
+EXPORT_VMESS_FILE="${BASE_EXPORT_DIR}/xray_vmess.txt"
 
 DEFAULT_START_PORT=20000
 DEFAULT_SOCKS_USERNAME="userb"
@@ -97,15 +102,15 @@ install_dependencies() {
     if [ ${#need_install[@]} -gt 0 ]; then
         warn "缺少以下依赖: ${need_install[*]}，正在自动安装..."
         if command -v apt-get &>/dev/null; then
-            apt-get update -y && apt-get install -y wget curl unzip iproute2
+            apt-get update -y && apt-get install -y wget curl unzip iproute2 iptables
         elif command -v yum &>/dev/null; then
-            yum install -y wget curl unzip iproute
+            yum install -y wget curl unzip iproute iptables
         elif command -v dnf &>/dev/null; then
-            dnf install -y wget curl unzip iproute
+            dnf install -y wget curl unzip iproute iptables
         elif command -v apk &>/dev/null; then
-            apk add --no-cache wget curl unzip iproute2
+            apk add --no-cache wget curl unzip iproute2 iptables ip6tables
         elif command -v pacman &>/dev/null; then
-            pacman -Sy --noconfirm wget curl unzip iproute2
+            pacman -Sy --noconfirm wget curl unzip iproute2 iptables
         else
             warn "未能识别包管理器，请确保已手动安装: ${need_install[*]}"
         fi
@@ -114,48 +119,54 @@ install_dependencies() {
     fi
 }
 
-# 3. 自动放行防火墙端口
+# 3. 自动放行防火墙端口 (IPv4 + IPv6 双栈)
 open_firewall() {
     local start_port=$1
     local end_port=$2
-    info "正在放行防火墙端口: ${start_port} ~ ${end_port} (TCP/UDP)..."
+    info "正在放行防火墙端口: ${start_port} ~ ${end_port} (TCP/UDP, IPv4 + IPv6)..."
 
-    # UFW 防火墙
+    # UFW 防火墙 (原生支持 v4 + v6)
     if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -qw "active"; then
         ufw allow "${start_port}:${end_port}/tcp" >/dev/null 2>&1
         ufw allow "${start_port}:${end_port}/udp" >/dev/null 2>&1
-        info "UFW 端口规则已放行。"
+        info "UFW 双栈端口规则已放行。"
     fi
 
-    # Firewalld 防火墙
+    # Firewalld 防火墙 (原生支持 v4 + v6)
     if command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
         firewall-cmd --zone=public --add-port="${start_port}-${end_port}/tcp" --permanent >/dev/null 2>&1
         firewall-cmd --zone=public --add-port="${start_port}-${end_port}/udp" --permanent >/dev/null 2>&1
         firewall-cmd --reload >/dev/null 2>&1
-        info "Firewalld 端口规则已放行并重载。"
+        info "Firewalld 双栈端口规则已放行并重载。"
     fi
 
-    # iptables
+    # iptables (IPv4)
     if command -v iptables &>/dev/null; then
         iptables -C INPUT -p tcp --dport "${start_port}:${end_port}" -j ACCEPT >/dev/null 2>&1 || \
             iptables -I INPUT -p tcp --dport "${start_port}:${end_port}" -j ACCEPT >/dev/null 2>&1
         iptables -C INPUT -p udp --dport "${start_port}:${end_port}" -j ACCEPT >/dev/null 2>&1 || \
             iptables -I INPUT -p udp --dport "${start_port}:${end_port}" -j ACCEPT >/dev/null 2>&1
     fi
+
+    # ip6tables (IPv6)
+    if command -v ip6tables &>/dev/null; then
+        ip6tables -C INPUT -p tcp --dport "${start_port}:${end_port}" -j ACCEPT >/dev/null 2>&1 || \
+            ip6tables -I INPUT -p tcp --dport "${start_port}:${end_port}" -j ACCEPT >/dev/null 2>&1
+        ip6tables -C INPUT -p udp --dport "${start_port}:${end_port}" -j ACCEPT >/dev/null 2>&1 || \
+            ip6tables -I INPUT -p udp --dport "${start_port}:${end_port}" -j ACCEPT >/dev/null 2>&1
+    fi
 }
 
-# 4. 获取服务器所有有效 IP 地址（智能过滤）
-get_ip_addresses() {
+# 4. 获取服务器所有有效 IPv4
+get_ipv4_addresses() {
     local ips=()
-
-    # 优先使用 ip 命令提取公网 IPv4
     if command -v ip &>/dev/null; then
         while IFS= read -r ip_found; do
             [ -n "$ip_found" ] && ips+=("$ip_found")
         done < <(ip -4 addr show 2>/dev/null | grep -oE 'inet [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | awk '{print $2}' | grep -vE '^(127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|169\.254\.|0\.)' || true)
     fi
 
-    # 若未找到公网 IP（例如 NAT 架构 VPS），则回退获取所有本地有效 IPv4（排除 127.0.0.1）
+    # 若未找到公网 IP（例如 NAT 架构 VPS），则回退获取所有本地有效 IPv4
     if [ ${#ips[@]} -eq 0 ]; then
         if command -v ip &>/dev/null; then
             while IFS= read -r ip_found; do
@@ -171,19 +182,51 @@ get_ip_addresses() {
     fi
 
     # 去重
-    local unique_ips=()
-    for item in "${ips[@]}"; do
-        local duplicate=0
-        for u in "${unique_ips[@]}"; do
-            if [ "$item" == "$u" ]; then
-                duplicate=1
-                break
-            fi
-        done
-        [ $duplicate -eq 0 ] && unique_ips+=("$item")
-    done
+    echo "${ips[@]}" | tr ' ' '\n' | awk '!seen[$0]++' | tr '\n' ' '
+}
 
-    echo "${unique_ips[@]}"
+# 获取服务器所有有效 IPv6 (过滤 ::1, fe80, fc00, fd00 等)
+get_ipv6_addresses() {
+    local ips=()
+    if command -v ip &>/dev/null; then
+        while IFS= read -r ip_found; do
+            [ -n "$ip_found" ] && ips+=("$ip_found")
+        done < <(ip -6 addr show 2>/dev/null | grep -oE 'inet6 [a-fA-F0-9:]+' | awk '{print $2}' | grep -vE '^(::1|fe80|fc00|fd00)' || true)
+    fi
+    # 去重
+    echo "${ips[@]}" | tr ' ' '\n' | awk '!seen[$0]++' | tr '\n' ' '
+}
+
+# 获取主公网 IPv4 入口
+get_primary_ipv4() {
+    local primary_ip=""
+    primary_ip=$(curl -4sSL -m 3 https://api.ipify.org 2>/dev/null || curl -4sSL -m 3 https://ip.sb 2>/dev/null || true)
+    if [[ -z "$primary_ip" || ! "$primary_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        local local_v4=($(get_ipv4_addresses))
+        primary_ip="${local_v4[0]}"
+    fi
+    echo "$primary_ip"
+}
+
+# 获取主公网 IPv6 入口
+get_primary_ipv6() {
+    local primary_ip=""
+    primary_ip=$(curl -6sSL -m 3 https://api64.ipify.org 2>/dev/null || curl -6sSL -m 3 https://ip.sb 2>/dev/null || true)
+    if [[ -z "$primary_ip" || ! "$primary_ip" =~ : ]]; then
+        local local_v6=($(get_ipv6_addresses))
+        primary_ip="${local_v6[0]}"
+    fi
+    echo "$primary_ip"
+}
+
+# 格式化 IP（如果是 IPv6 自动添加方括号）
+format_ip_for_uri() {
+    local ip="$1"
+    if [[ "$ip" =~ : ]]; then
+        echo "[${ip}]"
+    else
+        echo "${ip}"
+    fi
 }
 
 # 5. 安装 Xray 内核与 Systemd 服务（增加文件描述符与并发限制）
@@ -225,7 +268,7 @@ install_xray() {
     info "配置 Systemd 守护服务（已优化文件描述符限制与高并发参数）..."
     cat <<EOF >"${SERVICE_FILE}"
 [Unit]
-Description=XrayL Multi-IP Service
+Description=XrayL Multi-IP Dual-Stack Service
 Documentation=https://github.com/XTLS/Xray-core
 After=network.target nss-lookup.target
 
@@ -252,9 +295,10 @@ EOF
     info "Xray 内核与服务安装完成！"
 }
 
-# 6. 配置生成与批量导出
+# 6. 配置生成与双栈/多落地路由
 config_xray() {
     local config_type="$1"
+    local ip_mode="$2" # 可选: v4, v6, dual
     mkdir -p "${CONFIG_DIR}"
 
     if [ "$config_type" != "socks" ] && [ "$config_type" != "vmess" ]; then
@@ -262,18 +306,51 @@ config_xray() {
         exit 1
     fi
 
-    local ip_list=($(get_ip_addresses))
-    if [ ${#ip_list[@]} -eq 0 ]; then
-        err "未能检测到有效 IP 地址，请检查服务器网络！"
+    local all_v4=($(get_ipv4_addresses))
+    local all_v6=($(get_ipv6_addresses))
+
+    echo -e "\n${CYAN}======================== 本机 IP 检测结果 ========================${PLAIN}"
+    echo -e " 检测到 ${#all_v4[@]} 个 IPv4 地址: ${all_v4[*]:-无}"
+    echo -e " 检测到 ${#all_v6[@]} 个 IPv6 地址: ${all_v6[*]:-无}"
+    echo -e "${CYAN}==================================================================${PLAIN}\n"
+
+    # 选择落地出口 IP 类型
+    local target_ips=()
+    if [ -n "$ip_mode" ]; then
+        case "$ip_mode" in
+            v4|ipv4) target_ips=("${all_v4[@]}") ;;
+            v6|ipv6) target_ips=("${all_v6[@]}") ;;
+            dual|all) target_ips=("${all_v4[@]}" "${all_v6[@]}") ;;
+            *) target_ips=("${all_v4[@]}" "${all_v6[@]}") ;;
+        esac
+    else
+        if [ ${#all_v4[@]} -gt 0 ] && [ ${#all_v6[@]} -gt 0 ]; then
+            echo -e "请选择作为【落地出口】的 IP 范围:"
+            echo -e "  1. 仅使用 IPv4 落地 (${#all_v4[@]} 个)"
+            echo -e "  2. 仅使用 IPv6 落地 (${#all_v6[@]} 个)"
+            echo -e "  3. IPv4 + IPv6 全部混合落地 (共 $(( ${#all_v4[@]} + ${#all_v6[@]} )) 个, 推荐)"
+            read -r -p "请输入选项 [1-3, 默认 3]: " ip_choice
+            case "$ip_choice" in
+                1) target_ips=("${all_v4[@]}") ;;
+                2) target_ips=("${all_v6[@]}") ;;
+                *) target_ips=("${all_v4[@]}" "${all_v6[@]}") ;;
+            esac
+        elif [ ${#all_v4[@]} -gt 0 ]; then
+            target_ips=("${all_v4[@]}")
+        elif [ ${#all_v6[@]} -gt 0 ]; then
+            target_ips=("${all_v6[@]}")
+        else
+            err "未能检测到任何有效 IP 地址，请检查服务器网络！"
+            exit 1
+        fi
+    fi
+
+    if [ ${#target_ips[@]} -eq 0 ]; then
+        err "所选落地 IP 列表为空！"
         exit 1
     fi
 
-    echo -e "\n${CYAN}======================== 检测到的 IP 列表 ========================${PLAIN}"
-    for idx in "${!ip_list[@]}"; do
-        echo -e " [${idx}] ${ip_list[idx]}"
-    done
-    echo -e "${CYAN}共检测到 ${#ip_list[@]} 个 IP 地址。${PLAIN}"
-    echo -e "${CYAN}==================================================================${PLAIN}\n"
+    echo -e "\n${GREEN}已选定 ${#target_ips[@]} 个落地 IP 节点。${PLAIN}"
 
     read -r -p "起始端口 (默认 $DEFAULT_START_PORT): " START_PORT
     START_PORT=${START_PORT:-$DEFAULT_START_PORT}
@@ -291,26 +368,33 @@ config_xray() {
         WS_PATH=${WS_PATH:-$DEFAULT_WS_PATH}
     fi
 
-    local end_port=$((START_PORT + ${#ip_list[@]} - 1))
+    local end_port=$((START_PORT + ${#target_ips[@]} - 1))
+
+    # 获取主入口 IP（IPv4 与 IPv6）
+    local primary_v4
+    primary_v4=$(get_primary_ipv4)
+    local primary_v6
+    primary_v6=$(get_primary_ipv6)
 
     # 生成配置 TOML 文件 (关闭冗余日志，设置 warning 级别)
     local config_content=""
-    config_content+="# XrayL Multi-IP Configuration\n"
+    config_content+="# XrayL Multi-IP Dual-Stack Inbound & Dedicated Outbound Configuration\n"
     config_content+="[log]\n"
     config_content+="loglevel = \"warning\"\n\n"
 
     # 清空导出列表
-    if [ "$config_type" == "socks" ]; then
-        > "${EXPORT_SOCKS_FILE}"
-    elif [ "$config_type" == "vmess" ]; then
-        > "${EXPORT_VMESS_FILE}"
-    fi
+    > "${EXPORT_SOCKS_FILE}"
+    > "${EXPORT_SOCKS_IPV4_FILE}"
+    > "${EXPORT_SOCKS_IPV6_FILE}"
+    > "${EXPORT_SOCKS_DIRECT_FILE}"
+    > "${EXPORT_VMESS_FILE}"
 
-    for ((i = 0; i < ${#ip_list[@]}; i++)); do
-        local cur_ip="${ip_list[i]}"
+    for ((i = 0; i < ${#target_ips[@]}; i++)); do
+        local egress_ip="${target_ips[i]}"
         local cur_port=$((START_PORT + i))
         local tag_name="tag_$((i + 1))"
 
+        # 【核心改进】：入站省略 listen / 绑定全局双栈，让 IPv4 与 IPv6 均可作为入口连接此端口
         config_content+="[[inbounds]]\n"
         config_content+="port = ${cur_port}\n"
         config_content+="protocol = \"${config_type}\"\n"
@@ -320,13 +404,25 @@ config_xray() {
         if [ "$config_type" == "socks" ]; then
             config_content+="auth = \"password\"\n"
             config_content+="udp = true\n"
-            config_content+="ip = \"${cur_ip}\"\n"
             config_content+="[[inbounds.settings.accounts]]\n"
             config_content+="user = \"${SOCKS_USERNAME}\"\n"
             config_content+="pass = \"${SOCKS_PASSWORD}\"\n"
 
-            # 导出 IP:端口:账号:密码
-            echo "${cur_ip}:${cur_port}:${SOCKS_USERNAME}:${SOCKS_PASSWORD}" >> "${EXPORT_SOCKS_FILE}"
+            # 1. 落地直连模式 (如果落地 IP 是独立公网 IP)
+            local formatted_egress
+            formatted_egress=$(format_ip_for_uri "$egress_ip")
+            echo "${formatted_egress}:${cur_port}:${SOCKS_USERNAME}:${SOCKS_PASSWORD}" >> "${EXPORT_SOCKS_DIRECT_FILE}"
+
+            # 2. 主 IPv4 入口模式 (端口映射各落地)
+            if [ -n "$primary_v4" ]; then
+                echo "${primary_v4}:${cur_port}:${SOCKS_USERNAME}:${SOCKS_PASSWORD}" >> "${EXPORT_SOCKS_IPV4_FILE}"
+            fi
+
+            # 3. 主 IPv6 入口模式 (端口映射各落地)
+            if [ -n "$primary_v6" ]; then
+                echo "[${primary_v6}]:${cur_port}:${SOCKS_USERNAME}:${SOCKS_PASSWORD}" >> "${EXPORT_SOCKS_IPV6_FILE}"
+            fi
+
         elif [ "$config_type" == "vmess" ]; then
             config_content+="[[inbounds.settings.clients]]\n"
             config_content+="id = \"${UUID}\"\n"
@@ -335,16 +431,17 @@ config_xray() {
             config_content+="[inbounds.streamSettings.wsSettings]\n"
             config_content+="path = \"${WS_PATH}\"\n"
 
-            # 生成 VMess 链接导出
             if command -v base64 &>/dev/null; then
-                local vmess_json="{\"v\":\"2\",\"ps\":\"MultiIP-${cur_ip}-${cur_port}\",\"add\":\"${cur_ip}\",\"port\":\"${cur_port}\",\"id\":\"${UUID}\",\"aid\":\"0\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"\",\"path\":\"${WS_PATH}\",\"tls\":\"\"}"
+                local entry_ip="${primary_v4:-$egress_ip}"
+                local vmess_json="{\"v\":\"2\",\"ps\":\"MultiIP-Port${cur_port}-Out-${egress_ip}\",\"add\":\"${entry_ip}\",\"port\":\"${cur_port}\",\"id\":\"${UUID}\",\"aid\":\"0\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"\",\"path\":\"${WS_PATH}\",\"tls\":\"\"}"
                 local vmess_link="vmess://$(echo -n "$vmess_json" | base64 | tr -d '\n')"
                 echo "$vmess_link" >> "${EXPORT_VMESS_FILE}"
             fi
         fi
 
+        # 【核心改进】：出站通过 sendThrough 强制从专属落地 IP 发出
         config_content+="\n[[outbounds]]\n"
-        config_content+="sendThrough = \"${cur_ip}\"\n"
+        config_content+="sendThrough = \"${egress_ip}\"\n"
         config_content+="protocol = \"freedom\"\n"
         config_content+="tag = \"${tag_name}\"\n\n"
 
@@ -354,10 +451,19 @@ config_xray() {
         config_content+="outboundTag = \"${tag_name}\"\n\n"
     done
 
+    # 写入主默认导出文件
+    if [ "$config_type" == "socks" ]; then
+        if [ -s "${EXPORT_SOCKS_IPV4_FILE}" ]; then
+            cp "${EXPORT_SOCKS_IPV4_FILE}" "${EXPORT_SOCKS_FILE}"
+        else
+            cp "${EXPORT_SOCKS_DIRECT_FILE}" "${EXPORT_SOCKS_FILE}"
+        fi
+    fi
+
     # 写入配置文件
     echo -e "$config_content" > "${CONFIG_FILE}"
 
-    # 放行防火墙端口
+    # 放行双栈防火墙端口
     open_firewall "$START_PORT" "$end_port"
 
     # 重启并检查服务
@@ -374,17 +480,24 @@ config_xray() {
     # 输出配置与导出信息
     echo -e "\n${GREEN}======================== 配置生成成功 ========================${PLAIN}"
     echo -e " 协议类型: ${CYAN}${config_type}${PLAIN}"
-    echo -e " 端口范围: ${CYAN}${START_PORT} ~ ${end_port}${PLAIN} (共 ${#ip_list[@]} 个节点)"
+    echo -e " 端口范围: ${CYAN}${START_PORT} ~ ${end_port}${PLAIN} (共 ${#target_ips[@]} 个独立出口节点)"
+    echo -e " 入口支持: ${GREEN}IPv4 (${primary_v4:-无}) / IPv6 (${primary_v6:-无}) 双栈全局监听${PLAIN}"
+    echo -e " 出口规则: ${CYAN}每个端口独立对应一个落地 IP (sendThrough)${PLAIN}"
+
     if [ "$config_type" == "socks" ]; then
         echo -e " SOCKS 账号: ${CYAN}${SOCKS_USERNAME}${PLAIN}"
         echo -e " SOCKS 密码: ${CYAN}${SOCKS_PASSWORD}${PLAIN}"
-        echo -e " 批量导出文件: ${YELLOW}${EXPORT_SOCKS_FILE}${PLAIN}"
-        echo -e " 导出格式: ${CYAN}IP:端口:账号:密码${PLAIN}"
+        echo -e "--------------------------------------------------------------"
+        echo -e " 📂 导出文件汇总 (格式: ${CYAN}IP:端口:账号:密码${PLAIN}):"
+        echo -e "  1. 默认通用导出: ${YELLOW}${EXPORT_SOCKS_FILE}${PLAIN}"
+        [ -n "$primary_v4" ] && echo -e "  2. 主 IPv4 入口列表: ${YELLOW}${EXPORT_SOCKS_IPV4_FILE}${PLAIN}"
+        [ -n "$primary_v6" ] && echo -e "  3. 主 IPv6 入口列表: ${YELLOW}${EXPORT_SOCKS_IPV6_FILE}${PLAIN}"
+        echo -e "  4. 落地 IP 直连列表: ${YELLOW}${EXPORT_SOCKS_DIRECT_FILE}${PLAIN}"
         echo -e "--------------------------------------------------------------"
         echo -e " 节点预览 (前 5 个):"
         head -n 5 "${EXPORT_SOCKS_FILE}"
-        if [ "${#ip_list[@]}" -gt 5 ]; then
-            echo -e " ... (更多请查看 ${EXPORT_SOCKS_FILE})"
+        if [ "${#target_ips[@]}" -gt 5 ]; then
+            echo -e " ... (完整列表请查看 ${EXPORT_SOCKS_FILE})"
         fi
     elif [ "$config_type" == "vmess" ]; then
         echo -e " UUID: ${CYAN}${UUID}${PLAIN}"
@@ -393,8 +506,8 @@ config_xray() {
         echo -e "--------------------------------------------------------------"
         echo -e " 节点链接预览 (前 3 个):"
         head -n 3 "${EXPORT_VMESS_FILE}"
-        if [ "${#ip_list[@]}" -gt 3 ]; then
-            echo -e " ... (更多请查看 ${EXPORT_VMESS_FILE})"
+        if [ "${#target_ips[@]}" -gt 3 ]; then
+            echo -e " ... (完整列表请查看 ${EXPORT_VMESS_FILE})"
         fi
     fi
     echo -e "${GREEN}==============================================================${PLAIN}\n"
@@ -439,14 +552,14 @@ uninstall_xray() {
 show_menu() {
     clear
     echo -e "${CYAN}====================================================${PLAIN}"
-    echo -e "${CYAN}       Xray 多 IP / 多出口代理一键部署管理脚本      ${PLAIN}"
+    echo -e "${CYAN}   Xray 多 IP / 双栈入口与多出口代理一键部署管理    ${PLAIN}"
     echo -e "${CYAN}====================================================${PLAIN}"
-    echo -e "  ${GREEN}1.${PLAIN} 配置 SOCKS5 多 IP 代理 (批量生成 IP:端口:账号:密码)"
-    echo -e "  ${GREEN}2.${PLAIN} 配置 VMess+WS 多 IP 代理 (批量生成 vmess:// 链接)"
+    echo -e "  ${GREEN}1.${PLAIN} 配置 SOCKS5 多 IP 代理 (IPv4+IPv6 双栈入口，端口分流落地)"
+    echo -e "  ${GREEN}2.${PLAIN} 配置 VMess+WS 多 IP 代理 (双栈入口，批量生成 vmess:// 链接)"
     echo -e "  ${GREEN}3.${PLAIN} 查看服务运行状态"
     echo -e "  ${GREEN}4.${PLAIN} 重启代理服务"
     echo -e "  ${GREEN}5.${PLAIN} 停止代理服务"
-    echo -e "  ${GREEN}6.${PLAIN} 查看导出文件列表 (Proxies)"
+    echo -e "  ${GREEN}6.${PLAIN} 查看导出文件列表 (Proxies / IP:Port:User:Pass)"
     echo -e "  ${GREEN}7.${PLAIN} 彻底卸载 XrayL"
     echo -e "  ${GREEN}0.${PLAIN} 退出"
     echo -e "${CYAN}====================================================${PLAIN}"
@@ -471,15 +584,20 @@ show_menu() {
             ;;
         6)
             if [ -f "$EXPORT_SOCKS_FILE" ]; then
-                echo -e "\n${GREEN}SOCKS5 导出列表 (${EXPORT_SOCKS_FILE}):${PLAIN}"
+                echo -e "\n${GREEN}默认导出列表 (${EXPORT_SOCKS_FILE}):${PLAIN}"
                 cat "$EXPORT_SOCKS_FILE"
             fi
-            if [ -f "$EXPORT_VMESS_FILE" ]; then
+            if [ -f "$EXPORT_SOCKS_IPV4_FILE" ] && [ -s "$EXPORT_SOCKS_IPV4_FILE" ]; then
+                echo -e "\n${GREEN}IPv4 入口列表 (${EXPORT_SOCKS_IPV4_FILE}):${PLAIN}"
+                cat "$EXPORT_SOCKS_IPV4_FILE"
+            fi
+            if [ -f "$EXPORT_SOCKS_IPV6_FILE" ] && [ -s "$EXPORT_SOCKS_IPV6_FILE" ]; then
+                echo -e "\n${GREEN}IPv6 入口列表 (${EXPORT_SOCKS_IPV6_FILE}):${PLAIN}"
+                cat "$EXPORT_SOCKS_IPV6_FILE"
+            fi
+            if [ -f "$EXPORT_VMESS_FILE" ] && [ -s "$EXPORT_VMESS_FILE" ]; then
                 echo -e "\n${GREEN}VMess 导出列表 (${EXPORT_VMESS_FILE}):${PLAIN}"
                 cat "$EXPORT_VMESS_FILE"
-            fi
-            if [ ! -f "$EXPORT_SOCKS_FILE" ] && [ ! -f "$EXPORT_VMESS_FILE" ]; then
-                warn "未找到已导出的代理列表文件。"
             fi
             ;;
         7)
@@ -507,11 +625,11 @@ main() {
         case "$1" in
             socks)
                 [ -x "$BIN_PATH" ] || install_xray
-                config_xray "socks"
+                config_xray "socks" "$2"
                 ;;
             vmess)
                 [ -x "$BIN_PATH" ] || install_xray
-                config_xray "vmess"
+                config_xray "vmess" "$2"
                 ;;
             status)
                 service_status
@@ -530,11 +648,11 @@ main() {
                 uninstall_xray
                 ;;
             help|-h|--help)
-                echo "用法: $0 [socks|vmess|status|restart|stop|export|uninstall]"
+                echo "用法: $0 [socks|vmess|status|restart|stop|export|uninstall] [v4|v6|dual]"
                 ;;
             *)
                 err "未知参数: $1"
-                echo "用法: $0 [socks|vmess|status|restart|stop|export|uninstall]"
+                echo "用法: $0 [socks|vmess|status|restart|stop|export|uninstall] [v4|v6|dual]"
                 exit 1
                 ;;
         esac
