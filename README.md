@@ -5,9 +5,10 @@
 [![Xray-core](https://img.shields.io/badge/Core-Xray--core-red.svg)](https://github.com/XTLS/Xray-core)
 [![BBR Enabled](https://img.shields.io/badge/BBR-Auto--Accelerated-brightgreen.svg)](#)
 [![IPv6 Subnet](https://img.shields.io/badge/IPv6%20Subnet-%2F64%20Auto--Binding-orange.svg)](#)
+[![Cloudflare DDNS](https://img.shields.io/badge/DDNS-Cloudflare%20Auto--Sync-blue.svg)](#)
 
 专为**多 IP / 站群 VPS 服务器**打造的 Xray 批量代理自动化部署与管理脚本。
-支持 **原生标准 SOCKS5 与 VMess+WS**、**全自动 Google BBR 内核加速**、**IPv4 + IPv6 双栈全局入口**、**IPv6 子网（/64、/56 等）批量生成与开机持久化绑定**，并通过**端口映射精确区分各落地出口 IP**。
+支持 **原生标准 SOCKS5 与 VMess+WS**、**全自动 Google BBR 内核加速**、**Cloudflare DDNS 域名自动解析**、**IPv4 + IPv6 双栈全局入口**、**IPv6 子网（/64、/56 等）批量生成与开机持久化绑定**，并通过**端口映射精确区分各落地出口 IP**。
 
 广泛适用于跨境电商多店铺防关联、爬虫 IP 池矩阵、海外社媒自动化及多出口代理网络。
 
@@ -49,9 +50,12 @@
    - `xray_proxies.txt`：标准列表（`IP:端口:账号:密码`）。
    - `xray_proxies_ipv4_entry.txt`：主 IPv4 统一入口列表。
    - `xray_proxies_ipv6_entry.txt`：主 IPv6 统一入口列表。
+   - `xray_proxies_domain_entry.txt`：域名入口列表（配置 DDNS 后自动生成）。
    - `xray_proxies_direct.txt`：落地 IP 直连列表。
    - `xray_vmess.txt`：VMess 分享链接列表。
-6. **⚡ 高并发优化与防爆盘**
+6. **🔄 Cloudflare DDNS 域名自动解析**
+   - 集成 Cloudflare API，入口 IP 变化时**自动更新 DNS A/AAAA 记录**，每 1 分钟检测一次。配置域名后，代理导出列表自动使用域名替代 IP，客户端无需重新配置。
+7. **⚡ 高并发优化与防爆盘**
    - `LimitNOFILE=65535` 句柄调优 + `[log] loglevel = "warning"` 屏蔽冗余日志。
 
 ---
@@ -85,6 +89,14 @@ bash <(wget -qO- https://raw.githubusercontent.com/674542449/xray-multi-ip/main/
   ```bash
   bash <(curl -fsSLk https://raw.githubusercontent.com/674542449/xray-multi-ip/main/xrayL.sh) ipv6
   ```
+- **配置 Cloudflare DDNS（域名自动解析入口 IP）**：
+  ```bash
+  bash <(curl -fsSLk https://raw.githubusercontent.com/674542449/xray-multi-ip/main/xrayL.sh) ddns-setup
+  ```
+- **手动触发一次 DDNS 更新**：
+  ```bash
+  bash <(curl -fsSLk https://raw.githubusercontent.com/674542449/xray-multi-ip/main/xrayL.sh) ddns
+  ```
 
 ---
 
@@ -94,6 +106,8 @@ bash <(wget -qO- https://raw.githubusercontent.com/674542449/xray-multi-ip/main/
 | :--- | :--- |
 | **打开交互式主菜单** | `bash <(curl -fsSLk https://raw.githubusercontent.com/674542449/xray-multi-ip/main/xrayL.sh)` |
 | **检测/开启 BBR 加速** | `bash <(curl -fsSLk https://raw.githubusercontent.com/674542449/xray-multi-ip/main/xrayL.sh) bbr` |
+| **配置 Cloudflare DDNS** | `bash <(curl -fsSLk https://raw.githubusercontent.com/674542449/xray-multi-ip/main/xrayL.sh) ddns-setup` |
+| **手动触发 DDNS 更新** | `bash <(curl -fsSLk https://raw.githubusercontent.com/674542449/xray-multi-ip/main/xrayL.sh) ddns` |
 | **查看服务运行状态** | `bash <(curl -fsSLk https://raw.githubusercontent.com/674542449/xray-multi-ip/main/xrayL.sh) status` |
 | **查看已导出的所有节点/链接** | `bash <(curl -fsSLk https://raw.githubusercontent.com/674542449/xray-multi-ip/main/xrayL.sh) export` |
 | **重启代理服务** | `bash <(curl -fsSLk https://raw.githubusercontent.com/674542449/xray-multi-ip/main/xrayL.sh) restart` |

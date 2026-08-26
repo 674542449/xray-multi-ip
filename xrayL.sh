@@ -43,6 +43,10 @@ EXPORT_SOCKS_IPV4_FILE="${BASE_EXPORT_DIR}/xray_proxies_ipv4_entry.txt"
 EXPORT_SOCKS_IPV6_FILE="${BASE_EXPORT_DIR}/xray_proxies_ipv6_entry.txt"
 EXPORT_SOCKS_DIRECT_FILE="${BASE_EXPORT_DIR}/xray_proxies_direct.txt"
 EXPORT_VMESS_FILE="${BASE_EXPORT_DIR}/xray_vmess.txt"
+EXPORT_DOMAIN_FILE="${BASE_EXPORT_DIR}/xray_proxies_domain_entry.txt"
+
+DDNS_CONFIG_FILE="${CONFIG_DIR}/ddns.conf"
+DDNS_SCRIPT="/usr/local/bin/xrayL-ddns"
 
 DEFAULT_START_PORT=20000
 DEFAULT_SOCKS_USERNAME="userb"
@@ -399,6 +403,237 @@ EOF
     info "已创建开机自启绑定脚本: ${IPV6_BIND_SCRIPT}"
 }
 
+# ======================== Cloudflare DDNS 模块 ========================
+
+load_ddns_config() {
+    CF_API_TOKEN=""
+    CF_ZONE_ID=""
+    CF_DOMAIN=""
+    CF_RECORD_NAME=""
+    if [ -f "${DDNS_CONFIG_FILE}" ]; then
+        source "${DDNS_CONFIG_FILE}"
+    fi
+}
+
+save_ddns_config() {
+    mkdir -p "${CONFIG_DIR}"
+    cat > "${DDNS_CONFIG_FILE}" << EOF
+CF_API_TOKEN="${CF_API_TOKEN}"
+CF_ZONE_ID="${CF_ZONE_ID}"
+CF_DOMAIN="${CF_DOMAIN}"
+CF_RECORD_NAME="${CF_RECORD_NAME}"
+EOF
+    chmod 600 "${DDNS_CONFIG_FILE}"
+}
+
+cloudflare_update_record() {
+    local record_type="$1"
+    local ip="$2"
+
+    local record_info
+    record_info=$(curl -sSL -m 10 -X GET \
+        "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?type=${record_type}&name=${CF_RECORD_NAME}" \
+        -H "Authorization: Bearer ${CF_API_TOKEN}" \
+        -H "Content-Type: application/json" 2>/dev/null)
+
+    local record_id current_ip
+    record_id=$(echo "$record_info" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+    current_ip=$(echo "$record_info" | grep -o '"content":"[^"]*"' | head -1 | cut -d'"' -f4)
+
+    if [ "$current_ip" == "$ip" ]; then
+        info "${record_type} 记录 ${CF_RECORD_NAME} 无需更新 (${ip})"
+        return 0
+    fi
+
+    local result
+    if [ -n "$record_id" ]; then
+        result=$(curl -sSL -m 10 -X PUT \
+            "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${record_id}" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data "{\"type\":\"${record_type}\",\"name\":\"${CF_RECORD_NAME}\",\"content\":\"${ip}\",\"ttl\":60,\"proxied\":false}" 2>/dev/null)
+    else
+        result=$(curl -sSL -m 10 -X POST \
+            "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data "{\"type\":\"${record_type}\",\"name\":\"${CF_RECORD_NAME}\",\"content\":\"${ip}\",\"ttl\":60,\"proxied\":false}" 2>/dev/null)
+    fi
+
+    if echo "$result" | grep -q '"success":true'; then
+        info "${record_type} 记录已更新: ${CF_RECORD_NAME} -> ${ip}"
+    else
+        err "${record_type} 记录更新失败！"
+        echo "$result" | grep -o '"message":"[^"]*"' | head -3
+        return 1
+    fi
+}
+
+cloudflare_ddns() {
+    load_ddns_config
+    if [ -z "$CF_API_TOKEN" ] || [ -z "$CF_ZONE_ID" ] || [ -z "$CF_RECORD_NAME" ]; then
+        err "Cloudflare DDNS 未配置，请先运行 ddns-setup 进行设置。"
+        return 1
+    fi
+
+    info "执行 Cloudflare DDNS 更新 (${CF_RECORD_NAME})..."
+
+    local current_v4
+    current_v4=$(curl -4sSL -m 5 https://api.ipify.org 2>/dev/null || curl -4sSL -m 5 https://ip.sb 2>/dev/null || true)
+    if [ -n "$current_v4" ] && [[ "$current_v4" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        cloudflare_update_record "A" "$current_v4"
+    fi
+
+    local current_v6
+    current_v6=$(curl -6sSL -m 5 https://api64.ipify.org 2>/dev/null || curl -6sSL -m 5 https://ip.sb 2>/dev/null || true)
+    if [ -n "$current_v6" ] && [[ "$current_v6" =~ : ]]; then
+        cloudflare_update_record "AAAA" "$current_v6"
+    fi
+}
+
+create_ddns_standalone_script() {
+    cat > "${DDNS_SCRIPT}" << 'SCRIPT_EOF'
+#!/usr/bin/env bash
+DDNS_CONF="/etc/xrayL/ddns.conf"
+[ -f "$DDNS_CONF" ] || exit 0
+source "$DDNS_CONF"
+[ -z "$CF_API_TOKEN" ] || [ -z "$CF_ZONE_ID" ] || [ -z "$CF_RECORD_NAME" ] && exit 0
+
+update_record() {
+    local rtype="$1" ip="$2"
+    local info=$(curl -sSL -m 10 -X GET \
+        "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?type=${rtype}&name=${CF_RECORD_NAME}" \
+        -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json" 2>/dev/null)
+    local rid=$(echo "$info" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+    local cur=$(echo "$info" | grep -o '"content":"[^"]*"' | head -1 | cut -d'"' -f4)
+    [ "$cur" == "$ip" ] && return 0
+    local data="{\"type\":\"${rtype}\",\"name\":\"${CF_RECORD_NAME}\",\"content\":\"${ip}\",\"ttl\":60,\"proxied\":false}"
+    if [ -n "$rid" ]; then
+        curl -sSL -m 10 -X PUT "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${rid}" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json" --data "$data" >/dev/null 2>&1
+    else
+        curl -sSL -m 10 -X POST "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json" --data "$data" >/dev/null 2>&1
+    fi
+}
+
+v4=$(curl -4sSL -m 5 https://api.ipify.org 2>/dev/null)
+[[ "$v4" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && update_record "A" "$v4"
+v6=$(curl -6sSL -m 5 https://api64.ipify.org 2>/dev/null)
+[[ "$v6" =~ : ]] && update_record "AAAA" "$v6"
+SCRIPT_EOF
+    chmod +x "${DDNS_SCRIPT}"
+}
+
+setup_ddns_cron() {
+    create_ddns_standalone_script
+    local cron_entry="* * * * * ${DDNS_SCRIPT} >/dev/null 2>&1"
+
+    local existing
+    existing=$(crontab -l 2>/dev/null | grep -v "xrayL-ddns" || true)
+    echo "${existing}
+${cron_entry}" | grep -v '^$' | crontab -
+
+    info "已设置每 1 分钟自动 DDNS 更新定时任务。"
+}
+
+remove_ddns_cron() {
+    local existing
+    existing=$(crontab -l 2>/dev/null | grep -v "xrayL-ddns" || true)
+    echo "$existing" | crontab -
+    info "已移除 DDNS 定时任务。"
+}
+
+setup_cloudflare_ddns() {
+    echo -e "\n${CYAN}================= Cloudflare DDNS 配置 =================${PLAIN}"
+    load_ddns_config
+
+    if [ -n "$CF_RECORD_NAME" ]; then
+        echo -e " 当前已配置域名: ${GREEN}${CF_RECORD_NAME}${PLAIN}"
+        echo -e " Zone ID: ${CF_ZONE_ID}"
+        read -r -p "是否重新配置？[y/N]: " reconf
+        if [[ ! "$reconf" =~ ^[yY]$ ]]; then
+            echo -e "\n选择操作:"
+            echo -e "  1. 立即手动更新 DDNS"
+            echo -e "  2. 重新设置定时任务"
+            echo -e "  3. 移除 DDNS 配置与定时任务"
+            echo -e "  0. 返回"
+            read -r -p "请选择 [0-3]: " sub_choice
+            case "$sub_choice" in
+                1) cloudflare_ddns ;;
+                2) setup_ddns_cron ;;
+                3)
+                    remove_ddns_cron
+                    rm -f "${DDNS_CONFIG_FILE}" "${DDNS_SCRIPT}"
+                    info "DDNS 配置已清除。"
+                    ;;
+            esac
+            return 0
+        fi
+    fi
+
+    echo -e "${CYAN}========================================================${PLAIN}"
+    echo -e " 需要准备:"
+    echo -e "  1. Cloudflare API Token (在 dash.cloudflare.com/profile/api-tokens 创建)"
+    echo -e "     权限需要: Zone - DNS - Edit"
+    echo -e "  2. 主域名 (例如 example.com，需已托管在 Cloudflare)"
+    echo -e "  3. 子域名前缀 (例如 proxy，完整域名 proxy.example.com)"
+    echo -e "${CYAN}========================================================${PLAIN}\n"
+
+    read -r -p "Cloudflare API Token: " CF_API_TOKEN
+    if [ -z "$CF_API_TOKEN" ]; then
+        err "API Token 不能为空！"
+        return 1
+    fi
+
+    read -r -p "主域名 (例如 example.com): " CF_DOMAIN
+    if [ -z "$CF_DOMAIN" ]; then
+        err "域名不能为空！"
+        return 1
+    fi
+
+    info "正在通过 API 获取 Zone ID..."
+    local zone_resp
+    zone_resp=$(curl -sSL -m 10 -X GET \
+        "https://api.cloudflare.com/client/v4/zones?name=${CF_DOMAIN}&status=active" \
+        -H "Authorization: Bearer ${CF_API_TOKEN}" \
+        -H "Content-Type: application/json" 2>/dev/null)
+
+    CF_ZONE_ID=$(echo "$zone_resp" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+
+    if [ -z "$CF_ZONE_ID" ]; then
+        err "无法获取 Zone ID！请检查:"
+        err "  1. API Token 是否正确且有 Zone:DNS:Edit 权限"
+        err "  2. 域名 ${CF_DOMAIN} 是否已托管在 Cloudflare"
+        return 1
+    fi
+    info "Zone ID: ${CF_ZONE_ID}"
+
+    read -r -p "子域名前缀 (例如 proxy，留空则使用主域名): " subdomain
+    if [ -n "$subdomain" ]; then
+        CF_RECORD_NAME="${subdomain}.${CF_DOMAIN}"
+    else
+        CF_RECORD_NAME="${CF_DOMAIN}"
+    fi
+
+    info "DDNS 域名: ${CF_RECORD_NAME}"
+    save_ddns_config
+
+    info "正在执行首次 DDNS 更新..."
+    cloudflare_ddns
+
+    read -r -p "是否设置每 1 分钟自动 DDNS 更新？[Y/n]: " auto_cron
+    if [[ ! "$auto_cron" =~ ^[nN]$ ]]; then
+        setup_ddns_cron
+    fi
+
+    echo -e "\n${GREEN}Cloudflare DDNS 配置完成！${PLAIN}"
+    echo -e " 域名: ${CYAN}${CF_RECORD_NAME}${PLAIN}"
+    echo -e " 之后部署代理时，导出列表将自动使用此域名作为入口。\n"
+}
+
+# ======================== Cloudflare DDNS 模块结束 ========================
+
 # 7. 安装 Xray 内核与 Systemd 服务
 install_xray() {
     install_dependencies
@@ -569,6 +804,14 @@ config_xray() {
     local primary_v6
     primary_v6=$(get_primary_ipv6)
 
+    # 加载域名配置（用于导出列表）
+    local entry_domain=""
+    load_ddns_config
+    if [ -n "$CF_RECORD_NAME" ]; then
+        entry_domain="$CF_RECORD_NAME"
+        echo -e " DDNS 域名入口: ${GREEN}${entry_domain}${PLAIN} (导出列表将优先使用域名)"
+    fi
+
     # 生成配置 TOML 文件 (关闭冗余日志，设置 warning 级别)
     local config_content=""
     config_content+="# XrayL Multi-IP Dual-Stack Inbound & Dedicated Outbound Configuration\n"
@@ -581,6 +824,7 @@ config_xray() {
     > "${EXPORT_SOCKS_IPV6_FILE}"
     > "${EXPORT_SOCKS_DIRECT_FILE}"
     > "${EXPORT_VMESS_FILE}"
+    > "${EXPORT_DOMAIN_FILE}"
 
     for ((i = 0; i < ${#target_ips[@]}; i++)); do
         local egress_ip="${target_ips[i]}"
@@ -616,6 +860,11 @@ config_xray() {
                 echo "[${primary_v6}]:${cur_port}:${SOCKS_USERNAME}:${SOCKS_PASSWORD}" >> "${EXPORT_SOCKS_IPV6_FILE}"
             fi
 
+            # 4. 域名入口模式
+            if [ -n "$entry_domain" ]; then
+                echo "${entry_domain}:${cur_port}:${SOCKS_USERNAME}:${SOCKS_PASSWORD}" >> "${EXPORT_DOMAIN_FILE}"
+            fi
+
         elif [ "$config_type" == "vmess" ]; then
             config_content+="[[inbounds.settings.clients]]\n"
             config_content+="id = \"${UUID}\"\n"
@@ -625,7 +874,7 @@ config_xray() {
             config_content+="path = \"${WS_PATH}\"\n"
 
             if command -v base64 &>/dev/null; then
-                local entry_ip="${primary_v4:-$egress_ip}"
+                local entry_ip="${entry_domain:-${primary_v4:-$egress_ip}}"
                 local vmess_json="{\"v\":\"2\",\"ps\":\"MultiIP-Port${cur_port}-Out-${egress_ip}\",\"add\":\"${entry_ip}\",\"port\":\"${cur_port}\",\"id\":\"${UUID}\",\"aid\":\"0\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"\",\"path\":\"${WS_PATH}\",\"tls\":\"\"}"
                 local vmess_link="vmess://$(echo -n "$vmess_json" | base64 | tr -d '\n')"
                 echo "$vmess_link" >> "${EXPORT_VMESS_FILE}"
@@ -644,9 +893,11 @@ config_xray() {
         config_content+="outboundTag = \"${tag_name}\"\n\n"
     done
 
-    # 写入主默认导出文件
+    # 写入主默认导出文件（域名优先）
     if [ "$config_type" == "socks" ]; then
-        if [ -s "${EXPORT_SOCKS_IPV4_FILE}" ]; then
+        if [ -n "$entry_domain" ] && [ -s "${EXPORT_DOMAIN_FILE}" ]; then
+            cp "${EXPORT_DOMAIN_FILE}" "${EXPORT_SOCKS_FILE}"
+        elif [ -s "${EXPORT_SOCKS_IPV4_FILE}" ]; then
             cp "${EXPORT_SOCKS_IPV4_FILE}" "${EXPORT_SOCKS_FILE}"
         else
             cp "${EXPORT_SOCKS_DIRECT_FILE}" "${EXPORT_SOCKS_FILE}"
@@ -679,6 +930,9 @@ config_xray() {
     fi
 
     echo -e " 端口范围: ${CYAN}${START_PORT} ~ ${end_port}${PLAIN} (共 ${#target_ips[@]} 个独立出口节点)"
+    if [ -n "$entry_domain" ]; then
+        echo -e " 域名入口: ${GREEN}${entry_domain}${PLAIN} (DDNS 自动解析)"
+    fi
     echo -e " 入口支持: ${GREEN}IPv4 (${primary_v4:-无}) / IPv6 (${primary_v6:-无}) 双栈全局监听${PLAIN}"
     echo -e " 出口规则: ${CYAN}每个端口独立对应一个落地 IP (sendThrough)${PLAIN}"
 
@@ -690,6 +944,7 @@ config_xray() {
         echo -e "  1. 默认通用导出: ${YELLOW}${EXPORT_SOCKS_FILE}${PLAIN}"
         [ -n "$primary_v4" ] && echo -e "  2. 主 IPv4 入口列表: ${YELLOW}${EXPORT_SOCKS_IPV4_FILE}${PLAIN}"
         [ -n "$primary_v6" ] && echo -e "  3. 主 IPv6 入口列表: ${YELLOW}${EXPORT_SOCKS_IPV6_FILE}${PLAIN}"
+        [ -n "$entry_domain" ] && echo -e "  ★. 域名入口列表: ${YELLOW}${EXPORT_DOMAIN_FILE}${PLAIN} (${CYAN}${entry_domain}${PLAIN})"
         echo -e "  4. 落地 IP 直连列表: ${YELLOW}${EXPORT_SOCKS_DIRECT_FILE}${PLAIN}"
         echo -e "--------------------------------------------------------------"
         echo -e " 节点预览 (前 5 个):"
@@ -757,14 +1012,15 @@ show_menu() {
     echo -e "  ${GREEN}2.${PLAIN} 配置 VMess+WS 多 IP 代理 (双栈入口，批量生成 vmess:// 链接)"
     echo -e "  ${GREEN}3.${PLAIN} 批量生成并绑定 IPv6 子网地址 (如 /64 批量绑定 N 个 IP)"
     echo -e "  ${GREEN}4.${PLAIN} 启用/检测 Google BBR 网络加速"
-    echo -e "  ${GREEN}5.${PLAIN} 查看服务运行状态"
-    echo -e "  ${GREEN}6.${PLAIN} 重启代理服务"
-    echo -e "  ${GREEN}7.${PLAIN} 停止代理服务"
-    echo -e "  ${GREEN}8.${PLAIN} 查看导出文件列表 (Proxies / IP:Port:User:Pass)"
-    echo -e "  ${GREEN}9.${PLAIN} 彻底卸载 XrayL"
+    echo -e "  ${GREEN}5.${PLAIN} Cloudflare DDNS 配置与管理 (域名自动解析入口 IP)"
+    echo -e "  ${GREEN}6.${PLAIN} 查看服务运行状态"
+    echo -e "  ${GREEN}7.${PLAIN} 重启代理服务"
+    echo -e "  ${GREEN}8.${PLAIN} 停止代理服务"
+    echo -e "  ${GREEN}9.${PLAIN} 查看导出文件列表 (Proxies / IP:Port:User:Pass)"
+    echo -e "  ${GREEN}10.${PLAIN} 彻底卸载 XrayL"
     echo -e "  ${GREEN}0.${PLAIN} 退出"
     echo -e "${CYAN}====================================================${PLAIN}"
-    read -r -p "请输入选项 [0-9]: " choice
+    read -r -p "请输入选项 [0-10]: " choice
     case "$choice" in
         1)
             [ -x "$BIN_PATH" ] || install_xray
@@ -781,18 +1037,25 @@ show_menu() {
             enable_bbr
             ;;
         5)
-            service_status
+            setup_cloudflare_ddns
             ;;
         6)
-            service_restart
+            service_status
             ;;
         7)
-            service_stop
+            service_restart
             ;;
         8)
+            service_stop
+            ;;
+        9)
             if [ -f "$EXPORT_SOCKS_FILE" ]; then
                 echo -e "\n${GREEN}默认导出列表 (${EXPORT_SOCKS_FILE}):${PLAIN}"
                 cat "$EXPORT_SOCKS_FILE"
+            fi
+            if [ -f "$EXPORT_DOMAIN_FILE" ] && [ -s "$EXPORT_DOMAIN_FILE" ]; then
+                echo -e "\n${GREEN}域名入口列表 (${EXPORT_DOMAIN_FILE}):${PLAIN}"
+                cat "$EXPORT_DOMAIN_FILE"
             fi
             if [ -f "$EXPORT_SOCKS_IPV4_FILE" ] && [ -s "$EXPORT_SOCKS_IPV4_FILE" ]; then
                 echo -e "\n${GREEN}IPv4 入口列表 (${EXPORT_SOCKS_IPV4_FILE}):${PLAIN}"
@@ -807,7 +1070,7 @@ show_menu() {
                 cat "$EXPORT_VMESS_FILE"
             fi
             ;;
-        9)
+        10)
             uninstall_xray
             ;;
         0)
@@ -844,6 +1107,12 @@ main() {
             ipv6|bind-ipv6)
                 batch_generate_and_bind_ipv6
                 ;;
+            ddns)
+                cloudflare_ddns
+                ;;
+            ddns-setup)
+                setup_cloudflare_ddns
+                ;;
             status)
                 service_status
                 ;;
@@ -855,17 +1124,18 @@ main() {
                 ;;
             export)
                 [ -f "$EXPORT_SOCKS_FILE" ] && cat "$EXPORT_SOCKS_FILE"
+                [ -f "$EXPORT_DOMAIN_FILE" ] && [ -s "$EXPORT_DOMAIN_FILE" ] && cat "$EXPORT_DOMAIN_FILE"
                 [ -f "$EXPORT_VMESS_FILE" ] && cat "$EXPORT_VMESS_FILE"
                 ;;
             uninstall)
                 uninstall_xray
                 ;;
             help|-h|--help)
-                echo "用法: $0 [socks|vmess|bbr|ipv6|status|restart|stop|export|uninstall] [v4|v6|dual]"
+                echo "用法: $0 [socks|vmess|bbr|ipv6|ddns|ddns-setup|status|restart|stop|export|uninstall] [v4|v6|dual]"
                 ;;
             *)
                 err "未知参数: $1"
-                echo "用法: $0 [socks|vmess|bbr|ipv6|status|restart|stop|export|uninstall] [v4|v6|dual]"
+                echo "用法: $0 [socks|vmess|bbr|ipv6|ddns|ddns-setup|status|restart|stop|export|uninstall] [v4|v6|dual]"
                 exit 1
                 ;;
         esac
